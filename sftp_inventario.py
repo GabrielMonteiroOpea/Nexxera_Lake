@@ -413,7 +413,10 @@ def inspecionar(
     sftp: paramiko.SFTPClient,
     caminhos: list[tuple[str, int]],
     limite_bytes: int,
+    destino: str | None = None,
 ) -> None:
+    if destino:
+        os.makedirs(destino, exist_ok=True)
     for caminho, tamanho in caminhos:
         try:
             dados, truncado = ler_amostra(sftp, caminho, limite_bytes)
@@ -421,6 +424,12 @@ def inspecionar(
             print(f"[aviso] não foi possível ler {caminho}: {exc}", file=sys.stderr)
             continue
         analisar(caminho, dados, truncado, tamanho)
+        if destino:
+            local = os.path.join(destino, os.path.basename(caminho))
+            with open(local, "wb") as f:
+                f.write(dados)
+            print(f"  [salvo] {local}")
+            print()
 
 
 # --------------------------------------------------------------------------- #
@@ -530,15 +539,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument(
         "--amostra",
         type=int,
-        default=0,
+        default=1,
         metavar="N",
-        help="Após a varredura, analisa o formato dos N primeiros arquivos encontrados.",
+        help="Analisa o formato dos N primeiros arquivos listados (0 desliga; padrão: 1).",
     )
     g.add_argument(
         "--amostra-bytes",
         type=int,
         default=AMOSTRA_BYTES,
         help=f"Bytes baixados de cada arquivo analisado (padrão: {AMOSTRA_BYTES}).",
+    )
+    g.add_argument(
+        "--baixar",
+        metavar="PASTA",
+        help="Salva os arquivos analisados nesta pasta local (para inspeção offline).",
     )
     g.add_argument("--sem-csv", action="store_true", help="Não gera o CSV do inventário.")
     return p.parse_args(argv)
@@ -594,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.arquivo:
         try:
             tamanho = sftp.stat(args.arquivo).st_size or 0
-            inspecionar(sftp, [(args.arquivo, tamanho)], args.amostra_bytes)
+            inspecionar(sftp, [(args.arquivo, tamanho)], args.amostra_bytes, args.baixar)
         except IOError as exc:
             print(f"Erro ao abrir {args.arquivo}: {exc}", file=sys.stderr)
             return 1
@@ -639,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.amostra > 0 and entradas:
             alvos = [(e.caminho_completo, e.tamanho_bytes) for e in entradas[: args.amostra]]
             print(f"\nAnalisando o formato de {len(alvos)} arquivo(s):\n")
-            inspecionar(sftp, alvos, args.amostra_bytes)
+            inspecionar(sftp, alvos, args.amostra_bytes, args.baixar)
     finally:
         sftp.close()
         transport.close()
