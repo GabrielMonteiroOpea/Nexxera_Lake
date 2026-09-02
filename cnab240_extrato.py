@@ -67,21 +67,50 @@ IDENTIFICACAO = (
     ("nome_empresa", 73, 30, "txt"),
 )
 
-# Bloco de movimentacao (posicoes 103 a 240). ATENCAO: estas posicoes seguem a
-# referencia FEBRABAN e variam entre manuais de banco. Rode com --posicoes sobre
-# um arquivo real: a saida mostra onde estao as datas, os valores e o D/C, e o
-# ajuste aqui e de uma linha por campo.
+# Bloco de movimentacao (posicoes 103 a 240), medido nos arquivos reais da pasta
+# EXTRATO: posicoes identicas nos bancos 341 (Itau) e 033 (Santander).
+#   103-108 brancos
+#   109-111 DPV (Itau) / CDS (Santander)
+#   134     S/N
+#   135-142 data contabil -- o Santander preenche, o Itau deixa em branco
+#   143-150 data do lancamento (DDMMAAAA), sempre preenchida
+#   151-168 valor, 18 digitos com 2 decimais
+#   169     D/C
+#   170-176 codigo do historico do banco (o mesmo lancamento repete o codigo:
+#           0098 = SISPAG, 0045 = aplicacao automatica, ...)
+#   177-201 historico (texto)
+#   202-240 documento / complemento livre
 MOVIMENTACAO = (
-    ("natureza", 103, 3, "txt"),
-    ("tipo_complemento", 106, 2, "txt"),
-    ("complemento", 108, 20, "txt"),
-    ("data_contabil", 128, 8, "data"),
-    ("data_lancamento", 136, 8, "data"),
-    ("valor", 144, 15, "valor"),
-    ("debito_credito", 159, 1, "txt"),
-    ("codigo_historico", 160, 3, "txt"),
-    ("historico", 163, 25, "txt"),
-    ("documento", 188, 19, "txt"),
+    ("tipo_complemento", 109, 3, "txt"),
+    ("complemento", 112, 22, "txt"),
+    ("situacao", 134, 1, "txt"),
+    ("data_contabil", 135, 8, "data"),
+    ("data_lancamento", 143, 8, "data"),
+    ("valor", 151, 18, "valor"),
+    ("debito_credito", 169, 1, "txt"),
+    ("codigo_historico", 170, 7, "txt"),
+    ("historico", 177, 25, "txt"),
+    ("documento", 202, 39, "txt"),
+)
+
+# Header (tipo 1) e trailer (tipo 5) de lote carregam os saldos, nas mesmas
+# posicoes de data/valor/natureza do segmento E. Um arquivo pode ter mais de um
+# lote (um por tipo de conta), e ha lotes sem nenhum lancamento.
+HEADER_LOTE = (
+    ("data_saldo", 143, 8, "data"),
+    ("valor_saldo", 151, 18, "valor"),
+    ("natureza_saldo", 169, 1, "txt"),
+    ("situacao_saldo", 170, 1, "txt"),
+    ("moeda", 171, 3, "txt"),
+)
+TRAILER_LOTE = (
+    ("data_saldo", 143, 8, "data"),
+    ("valor_saldo", 151, 18, "valor"),
+    ("natureza_saldo", 169, 1, "txt"),
+    ("situacao_saldo", 170, 1, "txt"),
+    ("qtd_registros_lote", 171, 6, "num"),
+    ("total_debitos", 177, 18, "valor"),
+    ("total_creditos", 195, 18, "valor"),
 )
 
 SEGMENTO_E = IDENTIFICACAO + MOVIMENTACAO
@@ -246,7 +275,13 @@ def conferir_layout(linha: str, ident: dict) -> list[str]:
             continue
         no_registro = linha[ini - 1 : ini - 1 + tam].strip().lstrip("0")
         referencia = esperado.lstrip("0")
-        if no_registro == referencia:
+        # o nome do arquivo pode ou nao concatenar o DV da conta, e o DV fica na
+        # posicao 71 (Santander 02271) ou na 72 (Itau 00910); a agencia 0350 do
+        # Itau nao traz DV no nome. Aceitar as tres convencoes.
+        aceitos = {no_registro}
+        if nome == "conta":
+            aceitos |= {no_registro + linha[70:71].strip(), no_registro + linha[71:72].strip()}
+        if referencia in aceitos:
             continue
         onde = localizar(linha, esperado)
         avisos.append(
@@ -375,6 +410,36 @@ def lancamentos_de_bytes(nome: str, bruto: bytes, avisar: bool = True) -> list[d
     return lancamentos(nome, registros_de_bytes(bruto, nome), avisar=avisar)
 
 
+def percorrer_lotes(linhas: list[str]) -> list[dict]:
+    """Agrupa os registros em lotes: header (1), detalhes (3) e trailer (5)."""
+    lotes: list[dict] = []
+    atual: dict | None = None
+    for linha in linhas:
+        tipo = tipo_registro(linha)
+        if tipo == "1":
+            atual = {"header": linha, "detalhes": [], "trailer": None}
+            lotes.append(atual)
+        elif tipo == "3" and atual is not None:
+            atual["detalhes"].append(linha)
+        elif tipo == "5" and atual is not None:
+            atual["trailer"] = linha
+            atual = None
+    return lotes
+
+
+def saldo(linha: str | None, campos) -> dict:
+    """Le o saldo de um header/trailer de lote, com o sinal da natureza C/D."""
+    if linha is None:
+        return {}
+    dados = fatiar(linha, campos)
+    for nome, _, _, tipo in campos:
+        if tipo == "valor" and dados.get(nome) is not None:
+            dados[nome] = dados[nome] / 100
+    if dados.get("natureza_saldo") == "D" and dados.get("valor_saldo") is not None:
+        dados["valor_saldo"] = -dados["valor_saldo"]
+    return dados
+
+
 def lancamentos(nome_arquivo: str, linhas: list[str], avisar: bool = True) -> list[dict]:
     ident = parse_nome(nome_arquivo)
     if not ident["banco"] and avisar:
@@ -383,28 +448,100 @@ def lancamentos(nome_arquivo: str, linhas: list[str], avisar: bool = True) -> li
             file=sys.stderr,
         )
 
-    linhas_e = [ln for ln in linhas if tipo_registro(ln) == "3" and segmento(ln) == "E"]
-    if avisar and linhas_e:
-        for aviso in conferir_layout(linhas_e[0], ident):
+    lotes = percorrer_lotes(linhas)
+    primeiro_e = next(
+        (
+            ln
+            for lote in lotes
+            for ln in lote["detalhes"]
+            if segmento(ln) == "E"
+        ),
+        None,
+    )
+    if avisar and primeiro_e is not None:
+        for aviso in conferir_layout(primeiro_e, ident):
             print(f"[conferir] {ident['arquivo']}: {aviso}", file=sys.stderr)
 
     registros = []
-    for linha in linhas_e:
-        campos = fatiar(linha, SEGMENTO_E)
-        centavos = campos.pop("valor", None)
-        dc = (campos.get("debito_credito") or "").upper()
-        valor = None if centavos is None else centavos / 100
-        registros.append(
+    for n_lote, lote in enumerate(lotes, 1):
+        inicial = saldo(lote["header"], HEADER_LOTE)
+        final = saldo(lote["trailer"], TRAILER_LOTE)
+        contexto = {
+            "n_lote": n_lote,
+            "moeda": inicial.get("moeda", ""),
+            "data_saldo_inicial": inicial.get("data_saldo"),
+            "saldo_inicial": inicial.get("valor_saldo"),
+            "data_saldo_final": final.get("data_saldo"),
+            "saldo_final": final.get("valor_saldo"),
+            "total_debitos_lote": final.get("total_debitos"),
+            "total_creditos_lote": final.get("total_creditos"),
+            "qtd_registros_lote": final.get("qtd_registros_lote"),
+        }
+        for linha in lote["detalhes"]:
+            if segmento(linha) != "E":
+                continue
+            campos = fatiar(linha, SEGMENTO_E)
+            centavos = campos.pop("valor", None)
+            dc = (campos.get("debito_credito") or "").upper()
+            valor = None if centavos is None else centavos / 100
+            registros.append(
+                {
+                    **ident,
+                    "conta_sem_dv": (campos.get("conta_reg") or "").lstrip("0"),
+                    "qtd_registros_arquivo": len(linhas),
+                    **contexto,
+                    **campos,
+                    "valor_centavos": centavos,
+                    "valor": valor,
+                    "valor_assinado": None if valor is None else (-valor if dc == "D" else valor),
+                }
+            )
+    return registros
+
+
+def conferir_saldos(nome_arquivo: str, linhas: list[str]) -> list[dict]:
+    """saldo inicial + soma dos lancamentos deve fechar com o saldo final."""
+    resultado = []
+    for n_lote, lote in enumerate(percorrer_lotes(linhas), 1):
+        inicial = saldo(lote["header"], HEADER_LOTE).get("valor_saldo")
+        final = saldo(lote["trailer"], TRAILER_LOTE).get("valor_saldo")
+        dados_final = saldo(lote["trailer"], TRAILER_LOTE)
+        data_corte = dados_final.get("data_saldo")
+        movimento = posteriores = 0.0
+        n_posteriores = 0
+        for linha in lote["detalhes"]:
+            if segmento(linha) != "E":
+                continue
+            campos = fatiar(linha, SEGMENTO_E)
+            centavos = campos.get("valor")
+            if centavos is None:
+                continue
+            reais = centavos / 100
+            assinado = -reais if campos.get("debito_credito") == "D" else reais
+            data_lanc = campos.get("data_lancamento")
+            if data_corte and data_lanc and data_lanc > data_corte:
+                posteriores += assinado
+                n_posteriores += 1
+            else:
+                movimento += assinado
+        esperado = None if inicial is None else round(inicial + movimento, 2)
+        resultado.append(
             {
-                **ident,
-                "qtd_registros_arquivo": len(linhas),
-                **campos,
-                "valor_centavos": centavos,
-                "valor": valor,
-                "valor_assinado": None if valor is None else (-valor if dc == "D" else valor),
+                "arquivo": os.path.basename(nome_arquivo),
+                "lote": n_lote,
+                "lancamentos": sum(1 for l in lote["detalhes"] if segmento(l) == "E"),
+                "saldo_inicial": inicial,
+                "movimento": round(movimento, 2),
+                "esperado": esperado,
+                "saldo_final": final,
+                "diferenca": None
+                if esperado is None or final is None
+                else round(final - esperado, 2),
+                "apos_data_saldo": n_posteriores,
+                "valor_apos_data_saldo": round(posteriores, 2),
             }
         )
-    return registros
+    return resultado
 
 
 COLUNAS = [
@@ -414,8 +551,17 @@ COLUNAS = [
     "agencia_id",
     "conta",
     "conta_5dig",
+    "conta_sem_dv",
     "data_arquivo",
     "sequencia",
+    "n_lote",
+    "moeda",
+    "data_saldo_inicial",
+    "saldo_inicial",
+    "data_saldo_final",
+    "saldo_final",
+    "total_debitos_lote",
+    "total_creditos_lote",
     "lote",
     "sequencial",
     "segmento",
@@ -427,6 +573,7 @@ COLUNAS = [
     "codigo_historico",
     "historico",
     "documento",
+    "situacao",
     "debito_credito",
     "valor_centavos",
     "valor",
@@ -445,15 +592,32 @@ COLUNAS = [
 ]
 
 
+COLUNAS_DATA = (
+    "data_arquivo",
+    "data_saldo_inicial",
+    "data_saldo_final",
+    "data_contabil",
+    "data_lancamento",
+)
+
+
+def arrumar(registros: list[dict]) -> pd.DataFrame:
+    """Ordena as colunas e converte as datas para datetime64."""
+    if not registros:
+        return pd.DataFrame(columns=COLUNAS)
+    df = pd.DataFrame(registros)
+    for coluna in COLUNAS_DATA:
+        if coluna in df.columns:
+            df[coluna] = pd.to_datetime(df[coluna], errors="coerce")
+    ordenadas = [c for c in COLUNAS if c in df.columns]
+    return df[ordenadas + [c for c in df.columns if c not in ordenadas]]
+
+
 def montar_dataframe(caminhos: list[str], avisar: bool = True) -> pd.DataFrame:
     registros: list[dict] = []
     for caminho in caminhos:
         registros.extend(lancamentos_do_arquivo(caminho, avisar=avisar))
-    if not registros:
-        return pd.DataFrame(columns=COLUNAS)
-    df = pd.DataFrame(registros)
-    ordenadas = [c for c in COLUNAS if c in df.columns]
-    return df[ordenadas + [c for c in df.columns if c not in ordenadas]]
+    return arrumar(registros)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -466,6 +630,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--posicoes",
         action="store_true",
         help="Mostra o mapa do layout de cada registro, para calibrar as posicoes.",
+    )
+    p.add_argument(
+        "--conferir",
+        action="store_true",
+        help="Confere, por lote: saldo inicial + lancamentos = saldo final.",
     )
     p.add_argument("--saida", help="Grava o DataFrame neste CSV (delimitador ';').")
     p.add_argument("--linhas", type=int, default=20, help="Linhas exibidas (padrao: 20).")
@@ -488,6 +657,17 @@ def main(argv: list[str] | None = None) -> int:
         for caminho in caminhos:
             mostrar_posicoes(caminho)
         return 0
+
+    if args.conferir:
+        checagens = []
+        for caminho in caminhos:
+            checagens.extend(conferir_saldos(caminho, ler_registros(caminho)))
+        conf = pd.DataFrame(checagens)
+        with pd.option_context("display.width", 200, "display.max_columns", 20):
+            print(conf.to_string(index=False))
+        fecham = int((conf["diferenca"] == 0).sum())
+        print(f"{fecham}/{len(conf)} lote(s) fecham; " f"{len(conf) - fecham} com diferenca.")
+        return 0 if fecham == len(conf) else 1
 
     df = montar_dataframe(caminhos)
     if df.empty:

@@ -461,9 +461,7 @@ def montar_df(lidos: dict[str, bytes], saida: str | None) -> None:
         )
         return
 
-    df = pd.DataFrame(registros)
-    ordenadas = [c for c in cnab.COLUNAS if c in df.columns]
-    df = df[ordenadas + [c for c in df.columns if c not in ordenadas]]
+    df = cnab.arrumar(registros)
     print(f"\nDataFrame: {len(df)} lançamento(s) x {len(df.columns)} colunas\n")
     with pd.option_context("display.width", 220, "display.max_columns", 40):
         print(df.to_string(index=False))
@@ -569,7 +567,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g = p.add_argument_group("inspeção de conteúdo")
     g.add_argument(
         "--arquivo",
-        help="Analisa o formato deste arquivo e encerra (não varre a árvore).",
+        nargs="+",
+        metavar="CAMINHO",
+        help="Analisa estes arquivos e encerra (não lista a pasta). Aceita vários.",
     )
     g.add_argument(
         "--amostra",
@@ -653,14 +653,18 @@ def main(argv: list[str] | None = None) -> int:
     # Modo 1: analisar um único arquivo indicado na linha de comando.
     if args.arquivo:
         try:
-            tamanho = sftp.stat(args.arquivo).st_size or 0
-            limite = tamanho if args.df else args.amostra_bytes
-            lidos = inspecionar(sftp, [(args.arquivo, tamanho)], limite, args.baixar)
+            alvos = []
+            for caminho in args.arquivo:
+                try:
+                    alvos.append((caminho, sftp.stat(caminho).st_size or 0))
+                except IOError as exc:
+                    print(f"[aviso] nao consegui abrir {caminho}: {exc}", file=sys.stderr)
+            if not alvos:
+                return 1
+            limite = max(t for _, t in alvos) if args.df else args.amostra_bytes
+            lidos = inspecionar(sftp, alvos, limite, args.baixar)
             if args.df:
                 montar_df(lidos, args.df_saida)
-        except IOError as exc:
-            print(f"Erro ao abrir {args.arquivo}: {exc}", file=sys.stderr)
-            return 1
         finally:
             sftp.close()
             transport.close()
