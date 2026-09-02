@@ -414,15 +414,18 @@ def inspecionar(
     caminhos: list[tuple[str, int]],
     limite_bytes: int,
     destino: str | None = None,
-) -> None:
+) -> dict[str, bytes]:
+    """Analisa cada arquivo e devolve os bytes lidos, por caminho."""
     if destino:
         os.makedirs(destino, exist_ok=True)
+    lidos: dict[str, bytes] = {}
     for caminho, tamanho in caminhos:
         try:
             dados, truncado = ler_amostra(sftp, caminho, limite_bytes)
         except IOError as exc:
             print(f"[aviso] não foi possível ler {caminho}: {exc}", file=sys.stderr)
             continue
+        lidos[caminho] = dados
         analisar(caminho, dados, truncado, tamanho)
         if destino:
             local = os.path.join(destino, os.path.basename(caminho))
@@ -430,11 +433,43 @@ def inspecionar(
                 f.write(dados)
             print(f"  [salvo] {local}")
             print()
+    return lidos
 
 
 # --------------------------------------------------------------------------- #
 # Saída
 # --------------------------------------------------------------------------- #
+
+
+def montar_df(lidos: dict[str, bytes], saida: str | None) -> None:
+    """Monta o DataFrame de lançamentos CNAB 240 a partir dos bytes lidos."""
+    try:
+        import cnab240_extrato as cnab
+        import pandas as pd
+    except ImportError as exc:
+        print(f"[erro] --df exige pandas e cnab240_extrato.py: {exc}", file=sys.stderr)
+        return
+
+    registros: list[dict] = []
+    for caminho, dados in lidos.items():
+        registros.extend(cnab.lancamentos_de_bytes(os.path.basename(caminho), dados))
+
+    if not registros:
+        print(
+            "\nNenhum lançamento (registro 3 segmento E) nos arquivos amostrados.\n"
+            "Extratos de 4 registros (968 B) não têm movimento: use --maiores."
+        )
+        return
+
+    df = pd.DataFrame(registros)
+    ordenadas = [c for c in cnab.COLUNAS if c in df.columns]
+    df = df[ordenadas + [c for c in df.columns if c not in ordenadas]]
+    print(f"\nDataFrame: {len(df)} lançamento(s) x {len(df.columns)} colunas\n")
+    with pd.option_context("display.width", 220, "display.max_columns", 40):
+        print(df.to_string(index=False))
+    if saida:
+        df.to_csv(saida, sep=";", index=False, encoding="utf-8-sig")
+        print(f"\nDataFrame gravado em: {os.path.abspath(saida)}")
 
 
 def gravar_csv(destino: str, entradas: list[Entrada]) -> None:
@@ -554,6 +589,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="PASTA",
         help="Salva os arquivos analisados nesta pasta local (para inspeção offline).",
     )
+    g.add_argument(
+        "--maiores",
+        action="store_true",
+        help="Amostra os arquivos MAIORES em vez dos primeiros em ordem alfabética.",
+    )
+    g.add_argument(
+        "--df",
+        action="store_true",
+        help="Monta o DataFrame de lançamentos CNAB 240 dos arquivos amostrados.",
+    )
+    g.add_argument("--df-saida", metavar="CSV", help="Grava o DataFrame neste CSV.")
     g.add_argument("--sem-csv", action="store_true", help="Não gera o CSV do inventário.")
     return p.parse_args(argv)
 
@@ -608,7 +654,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.arquivo:
         try:
             tamanho = sftp.stat(args.arquivo).st_size or 0
-            inspecionar(sftp, [(args.arquivo, tamanho)], args.amostra_bytes, args.baixar)
+            limite = tamanho if args.df else args.amostra_bytes
+            lidos = inspecionar(sftp, [(args.arquivo, tamanho)], limite, args.baixar)
+            if args.df:
+                montar_df(lidos, args.df_saida)
         except IOError as exc:
             print(f"Erro ao abrir {args.arquivo}: {exc}", file=sys.stderr)
             return 1
@@ -651,9 +700,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.amostra > 0 and entradas:
-            alvos = [(e.caminho_completo, e.tamanho_bytes) for e in entradas[: args.amostra]]
+            escolhidos = (
+                sorted(entradas, key=lambda e: e.tamanho_bytes, reverse=True)
+                if args.maiores
+                else entradas
+            )
+            alvos = [(e.caminho_completo, e.tamanho_bytes) for e in escolhidos[: args.amostra]]
+            # com --df o arquivo tem de vir inteiro, senao o ultimo registro fica cortado
+            limite = max(t for _, t in alvos) if args.df else args.amostra_bytes
             print(f"\nAnalisando o formato de {len(alvos)} arquivo(s):\n")
-            inspecionar(sftp, alvos, args.amostra_bytes, args.baixar)
+            lidos = inspecionar(sftp, alvos, limite, args.baixar)
+            if args.df:
+                montar_df(lidos, args.df_saida)
     finally:
         sftp.close()
         transport.close()
