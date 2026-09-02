@@ -1,0 +1,14 @@
+# segredos - nunca versionar
+.env
+pwd.env
+*.pem
+*.key
+
+# ambiente
+.venv/
+__pycache__/
+*.pyc
+
+# saidas geradas
+inventario_sftp.csv
+amostras/
