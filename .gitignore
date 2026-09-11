@@ -12,3 +12,6 @@ __pycache__/
 # saidas geradas
 inventario_sftp.csv
 amostras/
+
+# lago do pipeline medalhao
+lake/

@@ -1,2 +1,4 @@
 paramiko>=3.4
 pandas>=2.2
+# opcional: prata/ouro em parquet (medalhao.py --formato parquet)
+# pyarrow>=15

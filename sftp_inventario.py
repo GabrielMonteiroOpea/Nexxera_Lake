@@ -7,6 +7,11 @@ em subpastas -- use --recursivo para varrer a arvore inteira. Com --amostra N (o
 --arquivo CAMINHO) baixa os primeiros bytes e deduz o layout: encoding, quebra de
 linha, delimitador ou largura fixa, numero de colunas, cabecalho e CNAB 240/400.
 
+Este script e a ferramenta de exploracao: lista, diagnostica layout e monta um
+DataFrame avulso da amostra. A carga do dia a dia e o pipeline medalhao do
+medalhao.py (bronze -> prata -> ouro), que baixa so os arquivos novos e mantem
+um unico dataset final -- disponivel aqui pelo atalho --medalhao.
+
 Credenciais vem do arquivo .env ao lado do script (SFTP_USER, SFTP_PASSWORD) ou
 das variaveis de ambiente equivalentes. Nunca ficam no codigo.
 
@@ -20,6 +25,9 @@ Exemplos
 
     # inventario recursivo do servidor inteiro, gravando CSV
     python sftp_inventario.py --path / --recursivo
+
+    # carga incremental no lago: so o que ainda nao foi ingerido
+    python sftp_inventario.py --medalhao
 """
 
 from __future__ import annotations
@@ -146,6 +154,38 @@ def conectar(
         raise RuntimeError("Não foi possível abrir o canal SFTP.")
     sftp.get_channel().settimeout(timeout)
     return sftp, transport
+
+
+def credenciais(user: str | None, key: str | None) -> tuple[str, str | None]:
+    """Resolve usuario e senha do ambiente/.env, perguntando se faltar."""
+    user = user or os.environ.get("SFTP_USER") or perguntar("Usuário SFTP: ")
+    if not user:
+        raise SystemExit("Erro: usuário não informado (use --user ou SFTP_USER).")
+    if key:
+        return user, None
+    senha = os.environ.get("SFTP_PASSWORD") or perguntar(
+        "Senha SFTP (não será exibida): ", secreto=True
+    )
+    if not senha:
+        raise SystemExit(
+            "Erro: defina SFTP_PASSWORD (variável de ambiente ou .env) "
+            "ou use --key para autenticação por chave."
+        )
+    return user, senha
+
+
+def abrir_sftp(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    user: str | None = None,
+    key: str | None = None,
+    timeout: float = 30.0,
+) -> tuple[paramiko.SFTPClient, paramiko.Transport]:
+    """Conexao pronta para uso, com credenciais resolvidas. Usada tambem pelo medalhao."""
+    carregar_env(ENV_FILES)
+    user, senha = credenciais(user, key)
+    print(f"Conectando em {user}@{host}:{port} ...", file=sys.stderr)
+    return conectar(host, port, user, senha, key, timeout)
 
 
 def carregar_chave(caminho: str) -> paramiko.PKey:
@@ -601,6 +641,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     g.add_argument("--df-saida", metavar="CSV", help="Grava o DataFrame neste CSV.")
     g.add_argument("--sem-csv", action="store_true", help="Não gera o CSV do inventário.")
+
+    m = p.add_argument_group("pipeline medalhão (bronze -> prata -> ouro)")
+    m.add_argument(
+        "--medalhao",
+        action="store_true",
+        help="Ingere no lago só os arquivos novos e refaz o arquivo final de ouro.",
+    )
+    m.add_argument(
+        "--lake",
+        default=os.environ.get("LAKE_PATH", "lake"),
+        help="Raiz do lago usada por --medalhao (padrão: lake).",
+    )
     return p.parse_args(argv)
 
 
@@ -617,31 +669,11 @@ def main(argv: list[str] | None = None) -> int:
     carregar_env(ENV_FILES)
     args = parse_args(argv)
 
-    if not args.user:
-        args.user = perguntar("Usuário SFTP: ")
-    if not args.user:
-        print("Erro: usuário não informado (use --user ou SFTP_USER).", file=sys.stderr)
-        return 2
-
-    senha = None
-    if not args.key:
-        senha = os.environ.get("SFTP_PASSWORD") or perguntar(
-            "Senha SFTP (não será exibida): ", secreto=True
-        )
-        if not senha:
-            print(
-                "Erro: defina SFTP_PASSWORD (variável de ambiente ou pwd.env) "
-                "ou use --key para autenticação por chave.",
-                file=sys.stderr,
-            )
-            return 2
-
     filtro = normalizar_ext(args.ext) if args.ext else None
 
-    print(f"Conectando em {args.user}@{args.host}:{args.port} ...", file=sys.stderr)
     try:
-        sftp, transport = conectar(
-            args.host, args.port, args.user, senha, args.key, args.timeout
+        sftp, transport = abrir_sftp(
+            args.host, args.port, args.user, args.key, args.timeout
         )
     except paramiko.AuthenticationException:
         print("Erro: falha de autenticação (usuário, senha ou chave inválidos).", file=sys.stderr)
@@ -683,6 +715,28 @@ def main(argv: list[str] | None = None) -> int:
     if pasta != args.path:
         print(f"[info] usando a pasta {pasta}", file=sys.stderr)
     args.path = pasta
+
+    # Modo 3: pipeline medalhao -- ingere so o que e novo e refaz o arquivo final.
+    if args.medalhao:
+        try:
+            import medalhao
+        except ImportError as exc:
+            print(f"[erro] --medalhao exige medalhao.py e pandas: {exc}", file=sys.stderr)
+            return 1
+        try:
+            lago = medalhao.Lago(raiz=args.lake)
+            print(f"Varrendo {args.path} para o lago {lago.raiz} ...")
+            resumo = medalhao.ingerir(
+                lago,
+                medalhao.candidatos_sftp(
+                    sftp, args.path, args.recursivo, tuple(filtro) if filtro else medalhao.EXT_PADRAO
+                ),
+            )
+            medalhao.imprimir_resumo(resumo, lago)
+        finally:
+            sftp.close()
+            transport.close()
+        return 0
 
     entradas: list[Entrada] = []
     try:
