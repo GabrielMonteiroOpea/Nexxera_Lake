@@ -562,12 +562,12 @@ COLUNAS = [
     "saldo_final",
     "total_debitos_lote",
     "total_creditos_lote",
+    "qtd_registros_lote",
     "lote",
     "sequencial",
     "segmento",
     "data_contabil",
     "data_lancamento",
-    "natureza",
     "tipo_complemento",
     "complemento",
     "codigo_historico",
@@ -579,6 +579,7 @@ COLUNAS = [
     "valor",
     "valor_assinado",
     "nome_empresa",
+    "tipo_inscricao",
     "inscricao",
     "convenio",
     "agencia_reg",
@@ -646,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
 
     caminhos: list[str] = []
     for padrao in args.arquivos:
-        achados = sorted(glob.glob(padrao))
+        achados = sorted(glob.glob(padrao, recursive=True))  # recursive: aceita '**'
         caminhos.extend(achados or [padrao])
     faltando = [c for c in caminhos if not os.path.isfile(c)]
     if faltando:
